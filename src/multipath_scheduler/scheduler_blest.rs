@@ -261,27 +261,25 @@ impl MultipathScheduler for BlestScheduler {
     }
    
     fn on_path_updated(&mut self, paths: &mut PathMap, event: PathEvent) {
-        // 首先，将事件传递给底层的调度器，这是一个好习惯
+       
         self.default_scheduler.on_path_updated(paths, event);
 
-        // 然后，处理BLEST自己的逻辑
+       
         if let Some(last_slow_id) = self.last_chosen_slow_path_id {
             match event {
-                // 当一个路径被抛弃时，检查它是否是正在观察的慢路径
-                PathEvent::Abandoned(abandoned_id) => { // <-- 使用正确的变体 'Abandoned'
+               
+                PathEvent::Abandoned(abandoned_id) => { 
                     if abandoned_id == last_slow_id {
-                        // 如果是，则清空观察状态，因为这个路径不再有效
+                       
                         self.last_chosen_slow_path_id = None;
                         self.last_chosen_slow_path_lost_count = 0;
                         self.last_slow_path_rtt_micros = 0;
                         debug!("BLEST: Last chosen slow path {} was abandoned, resetting observation.", abandoned_id);
                     }
                 }
-                // 你也可以处理其他事件，比如 Validated，如果需要的话
+              
                 PathEvent::Validated(validated_id) => {
-                    // 例如，如果一个路径刚刚验证通过，它可能成为一个新的快速路径候选者
-                    // 或者如果它就是我们正在观察的慢路径，也许可以重置一些状态
-                    // 但通常这里不需要做什么特殊处理
+                    
                 }
             }
         }
