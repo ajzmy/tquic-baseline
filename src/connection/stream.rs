@@ -188,6 +188,16 @@ impl StreamMap {
         }
     }
 
+
+    /// Returns the connection's send-side flow control limit.
+    pub fn conn_max_tx_data(&self) -> u64 { // <--- 标记添加了这个新方法
+        self.send_capacity.max_data
+    }
+
+    /// Returns the total amount of data sent on the entire connection.
+    pub fn conn_tx_data(&self) -> u64 { // <--- 标记添加这个新方法
+        self.send_capacity.tx_data
+    }
     /// Set trace id.
     pub fn set_trace_id(&mut self, trace_id: &str) {
         self.trace_id = trace_id.to_string();

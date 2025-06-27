@@ -1055,6 +1055,7 @@ pub enum Shutdown {
 }
 
 /// Important events about path
+#[derive(Clone, Copy, Debug)]
 pub enum PathEvent {
     /// The path has been validated.
     Validated(usize),
