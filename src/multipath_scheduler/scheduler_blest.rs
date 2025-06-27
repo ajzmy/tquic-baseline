@@ -128,86 +128,73 @@ impl MultipathScheduler for BlestScheduler {
     ) -> Result<usize> {
 
         let now = Instant::now();
-        let default_path_id = match self.default_scheduler.on_select(paths, spaces, streams) {
+        // Step 1: Identify the true "fastest" path based on lowest RTT among all active paths,
+        // regardless of its current ability to send (i.e., ignore `can_send()`).
+        let fastest_path_id = match paths
+            .iter()
+            .filter(|(_, p)| p.active() && p.dcid_seq.is_some())
+            .min_by_key(|(_, p)| p.recovery.rtt.smoothed_rtt())
+        {
+            Some((id, _)) => id,
+            None => return Err(Error::Done), // No active paths exist.
+        };
+
+        // Step 2: Use the default scheduler (MinRTT) to pick the best path that is *currently ready to send*.
+        // The MinRTT scheduler internally checks `can_send()`.
+        let candidate_path_id = match self.default_scheduler.on_select(paths, spaces, streams) {
             Ok(id) => id,
-            Err(e) => return Err(e), // No path available at all
+            Err(e) => return Err(e), // No path is currently available to send.
         };
-        let default_path_srtt = paths.get(default_path_id)?.recovery.rtt.smoothed_rtt();
-        //let default_path = paths.get(default_path_id)?;
-        // 2. Find the "fastest" currently available path
-        let mut fastest_path_id_opt: Option<usize> = None;
-        let mut min_srtt = Duration::MAX;
-        for (id, path) in paths.iter_mut() {
-            if id == default_path_id || !path.active() || !path.recovery.can_send() {
-                continue;
-            }
-            // Ensure path has a valid DCID to be usable
-            if path.dcid_seq.is_none() {
-                continue;
-            }
 
-            let srtt = path.recovery.rtt.smoothed_rtt();
-            if srtt < min_srtt && !srtt.is_zero() {
-                min_srtt = srtt;
-                fastest_path_id_opt = Some(id);
-            }
+
+        // Step 3: If the best available candidate is already the fastest path, use it without further checks.
+        if candidate_path_id == fastest_path_id {
+            // We are not choosing a "slow" path, so reset the observation state.
+            self.last_chosen_slow_path_id = None;
+            return Ok(candidate_path_id);
         }
-            
-         // 3. If default path is already the fastest, or no other faster path exists, use it.
-        let fastest_path_id = match fastest_path_id_opt {
-            Some(id) if default_path_srtt > min_srtt => id,
-            _ => {
-                // Default path is fastest or no other faster path, or default path RTT is not worse.
-                // Reset last_chosen_slow_path_id as we are not choosing a "slow" path guarded by BLEST
-                self.last_chosen_slow_path_id = None;
-                return Ok(default_path_id);
-            }
-        };
 
-        // 4. BLEST Logic: Default path is slower than `fastest_path_id`
-        let slow_path = paths.get(default_path_id)?;
+        // Step 4: The BLEST core logic is triggered. The candidate is a slower but available path,
+        // while the fastest path is likely congested (`can_send()` is false).
+        // We need to handle potential borrowing conflicts here by getting all needed data first.
+        let slow_path = paths.get(candidate_path_id)?;
         let fast_path = paths.get(fastest_path_id)?;
 
-        // Update lambda based on previous observation of the *current candidate* slow_path
-        // This is a simplification: MPTCP BLEST looked at retransmissions specific to the slow flow.
-        // Here, we check if the *candidate slow_path for this decision* had recent losses.
-        if self.last_chosen_slow_path_id == Some(default_path_id) {
-             self.update_lambda(paths, now); // Update lambda based on previous cycle's slow path
+        // Update lambda based on the performance of this slow path from the previous cycle.
+        if self.last_chosen_slow_path_id == Some(candidate_path_id) {
+            self.update_lambda(paths, now);
         } else {
-            // This is the first time we are considering this path as "slow"
-            // or a different slow path was chosen last time.
-            // We need to re-initialize observation for *this* slow_path for the *next* lambda update.
-            self.last_chosen_slow_path_id = Some(default_path_id);
+            // This is the first time we consider this path as "slow" in a while.
+            // Initialize its observation state for the *next* lambda update.
+            self.last_chosen_slow_path_id = Some(candidate_path_id);
             self.last_chosen_slow_path_lost_count = slow_path.recovery.stats.lost_count;
             self.last_slow_path_rtt_micros = slow_path.recovery.rtt.smoothed_rtt().as_micros() as u64;
-            self.last_lambda_update_time = now; // Reset update time for this new observation
+            self.last_lambda_update_time = now;
         }
-        
-         // Linger time for data on the slow path (simplified to its SRTT)
+
+        // Estimate the "linger time" of a packet sent on the slow path.
         let slow_path_linger_duration = slow_path.recovery.rtt.smoothed_rtt();
         if slow_path_linger_duration.is_zero() {
-            // Avoid division by zero or nonsensical linger time; use default path if RTT is unknown
-            return Ok(default_path_id);
+            // Cannot predict if RTT is unknown; use the candidate path as a safe fallback.
+            return Ok(candidate_path_id);
         }
+
+         // Estimate how many bytes the fast path could send during the slow path's linger time.
         let fast_path_potential_bytes = self.estimate_fast_path_bytes(fast_path, slow_path_linger_duration);
-        // Available connection-level send window for the fast path
-        // if we also commit to sending one packet on the slow path.
+
+
+        // Calculate the available connection-level flow control credit.
         let conn_send_capacity_max_data = streams.conn_max_tx_data(); 
         let conn_send_capacity_tx_data = streams.conn_tx_data();  
         let conn_flow_control_available = conn_send_capacity_max_data.saturating_sub(conn_send_capacity_tx_data);
         
-         // The critical resource is the connection's flow control window.
-        // If we send on the slow path, it uses up some of this window.
-        // The remaining window must be sufficient for what the fast path *could* send.
+        // If we send one packet on the slow path, how much credit remains for the fast path?
         let packet_size_on_slow_path = slow_path.recovery.max_datagram_size as u64;
-
-        // Available window for the fast path if we also send one packet on the slow path.
         let conn_window_if_slow_sends = conn_flow_control_available.saturating_sub(packet_size_on_slow_path);
 
-
         debug!(
-            "BLEST: SlowPath ({}) SRTT: {:?}, FastPath ({}) SRTT: {:?}",
-            default_path_id, slow_path.recovery.rtt.smoothed_rtt(),
+            "BLEST: Candidate(Slow) Path ({}) SRTT: {:?}, Fastest Path ({}) SRTT: {:?}",
+            candidate_path_id, slow_path.recovery.rtt.smoothed_rtt(),
             fastest_path_id, fast_path.recovery.rtt.smoothed_rtt()
         );
         debug!(
@@ -215,34 +202,23 @@ impl MultipathScheduler for BlestScheduler {
             fast_path_potential_bytes, conn_window_if_slow_sends, conn_flow_control_available, self.lambda_scaled
         );
 
-        
-         if fast_path_potential_bytes > conn_window_if_slow_sends {
-            // Sending on the slow path would starve the fast path due to connection-level flow control.
-            // So, don't send on the slow path *now*.
-            // The connection should still try to send *something*, so it might pick the fast path,
-            // or if only the slow path was viable from default scheduler, it means we wait.
+        // Step 5: The core BLEST decision.
+        if fast_path_potential_bytes > conn_window_if_slow_sends {
+            // VETO: Sending on the slow path would likely starve the fast path due to
+            // connection-level flow control limitations.
             debug!(
                 "BLEST: VETOING slow path {}. Fast potential {} > avail_if_slow_sends {}",
-                default_path_id, fast_path_potential_bytes, conn_window_if_slow_sends
+                candidate_path_id, fast_path_potential_bytes, conn_window_if_slow_sends
             );
-
-            // Critical: If we veto the slow path, should we try the fast path instead?
-            // Or just signal "don't send on *this* slow path now"?
-            // The original MPTCP BLEST returned NULL, meaning the scheduler overall decided not to send.
-            // For TQUIC, returning `Err(Error::Done)` tells the connection send loop that no path was selected by the scheduler.
-            // The send loop might then try to find *any* sendable packet (e.g. ACK, PING) or just wait.
-            // This seems like the correct equivalent of MPTCP's NULL.
+            // Returning `Err(Error::Done)` signals to the connection to wait, effectively
+            // "waiting for the faster subflow to become available".
             return Err(Error::Done);
         }
         
-
-        // BLEST allows sending on the (slower) default path.
-        // Record this choice for the next lambda update.
-        // (Already done above when `last_chosen_slow_path_id` was set/checked)
-        debug!("BLEST: ALLOWING slow path {}", default_path_id);
-        Ok(default_path_id)
+        // ALLOW: The risk of blocking is low, so we can use the slower candidate path.
+        debug!("BLEST: ALLOWING slow path {}", candidate_path_id);
+        Ok(candidate_path_id)
     }
-
 
      fn on_sent(
         &mut self,
