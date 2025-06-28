@@ -29,6 +29,7 @@ use crate::Error;
 use crate::MultipathConfig;
 use crate::PathEvent;
 use crate::Result;
+use self::scheduler_ecf::*;
 
 /// MultipathScheduler is a packet scheduler that decides the path over which
 /// the next QUIC packet will be sent.
@@ -86,6 +87,7 @@ pub enum MultipathAlgorithm {
     RoundRobin,
 
     Blest,
+    Ecf,
 }
 
 impl FromStr for MultipathAlgorithm {
@@ -100,6 +102,8 @@ impl FromStr for MultipathAlgorithm {
             Ok(MultipathAlgorithm::RoundRobin)
         } else if algor.eq_ignore_ascii_case("blest") { 
             Ok(MultipathAlgorithm::Blest)
+        } else if algor.eq_ignore_ascii_case("ecf") {
+            Ok(MultipathAlgorithm::Ecf)
         } 
         else {
             Err(Error::InvalidConfig("unknown".into()))
@@ -114,6 +118,7 @@ pub(crate) fn build_multipath_scheduler(conf: &MultipathConfig) -> Box<dyn Multi
         MultipathAlgorithm::Redundant => Box::new(RedundantScheduler::new(conf)),
         MultipathAlgorithm::RoundRobin => Box::new(RoundRobinScheduler::new(conf)),
         MultipathAlgorithm::Blest => Box::new(BlestScheduler::new(conf)),
+        MultipathAlgorithm::Ecf => Box::new(EcfScheduler::new(conf)),
     }
 }
 
@@ -123,6 +128,7 @@ pub(crate) fn buffer_required(algor: MultipathAlgorithm) -> bool {
         MultipathAlgorithm::Redundant => true,
         MultipathAlgorithm::RoundRobin => false,
         MultipathAlgorithm::Blest => false,
+        MultipathAlgorithm::Ecf => false,
     }
 }
 
@@ -204,7 +210,11 @@ pub(crate) mod tests {
             ("Roundrobin", Ok(MultipathAlgorithm::RoundRobin)),
             ("RoundRobin", Ok(MultipathAlgorithm::RoundRobin)),
             ("ROUNDROBIN", Ok(MultipathAlgorithm::RoundRobin)),
+            ("ecf", Ok(MultipathAlgorithm::Ecf)),
+            ("Ecf", Ok(MultipathAlgorithm::Ecf)),
+            ("ECF", Ok(MultipathAlgorithm::Ecf)),
             ("redun", Err(Error::InvalidConfig("unknown".into()))),
+            
         ];
 
         for (name, algor) in cases {
@@ -217,3 +227,4 @@ mod scheduler_minrtt;
 mod scheduler_redundant;
 mod scheduler_rr;
 mod scheduler_blest; 
+mod scheduler_ecf;
